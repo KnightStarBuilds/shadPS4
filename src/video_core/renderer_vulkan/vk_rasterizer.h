@@ -105,6 +105,7 @@ public:
 private:
     void PrepareRenderState(const GraphicsPipeline* pipeline);
     RenderState BeginRendering(const GraphicsPipeline* pipeline);
+    void CommitRenderState();
     void Resolve();
     void DepthStencilCopy(bool is_depth, bool is_stencil);
     void EliminateFastClear();
@@ -127,6 +128,7 @@ private:
     void BindIndexBuffer(u32 index_offset = 0, bool is_indirect = false);
 
     void ResetBindings(bool is_compute);
+    void DiscardBindings();
 
     bool IsComputeMetaClear(const Pipeline* pipeline);
     bool IsComputeImageCopy(const Pipeline* pipeline);
@@ -168,6 +170,8 @@ private:
     };
     std::vector<BoundBuffer> bound_buffers;
     std::vector<VideoCore::ImageId> bound_images;
+    boost::container::static_vector<std::pair<VAddr, u32>, AmdGpu::NUM_COLOR_BUFFERS + 1>
+        pending_meta_updates;
 
     u32 set_write_index{};
     Pipeline::DescriptorWrites set_writes;

@@ -1139,6 +1139,11 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
 
 Liverpool::CmdBuffer Liverpool::CopyCmdBuffers(std::span<const u32> dcb, std::span<const u32> ccb) {
     auto& queue = mapped_queues[GfxQueueId];
+    // Queued coroutines retain spans into these buffers until they are destroyed.
+    if (queue.submits.empty()) {
+        queue.ccb_buffer_offset = 0;
+        queue.dcb_buffer_offset = 0;
+    }
     ASSERT_MSG(queue.dcb_buffer.capacity() >= queue.dcb_buffer_offset + dcb.size(),
                "dcb copy buffer out of reserved space");
     ASSERT_MSG(queue.ccb_buffer.capacity() >= queue.ccb_buffer_offset + ccb.size(),
@@ -1172,16 +1177,14 @@ Liverpool::CmdBuffer Liverpool::CopyCmdBuffers(std::span<const u32> dcb, std::sp
 
 void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
     auto& queue = mapped_queues[GfxQueueId];
+    std::scoped_lock queue_lock{queue.m_access};
 
     if (EmulatorSettings.IsCopyGpuBuffers()) {
         std::tie(dcb, ccb) = CopyCmdBuffers(dcb, ccb);
     }
 
     auto task = ProcessGraphics(dcb, ccb);
-    {
-        std::scoped_lock lock{queue.m_access};
-        queue.submits.emplace(task.handle);
-    }
+    queue.submits.emplace(task.handle);
 
     std::scoped_lock lk{submit_mutex};
     ++num_submits;

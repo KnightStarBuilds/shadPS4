@@ -62,6 +62,8 @@ static bool IgnoresExecMask(const GcnInst& inst) {
     case Opcode::V_WRITELANE_B32:
     case Opcode::V_READFIRSTLANE_B32:
         return true;
+    case Opcode::EXP:
+        return inst.control.exp.vm;
     default:
         break;
     }

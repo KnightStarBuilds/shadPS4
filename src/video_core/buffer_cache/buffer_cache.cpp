@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <limits>
 #include <magic_enum/magic_enum.hpp>
 
 #include "common/alignment.h"
@@ -55,28 +56,34 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       stream_buffer{instance, scheduler, MemoryType::Stream, STREAM_BUFFER_SIZE},
       gds_buffer{instance, 0, GDS_BUFFER_SIZE, MemoryType::Stream, "GDS Buffer"},
       memory_semaphore{instance} {
-    const vk::BufferCreateInfo probe_ci = {
-        .flags =
-            vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency,
-        .size = ARENA_PAGE_SIZE,
-        .usage = ARENA_USAGE,
-        .sharingMode = vk::SharingMode::eExclusive,
-    };
-    const vk::DeviceBufferMemoryRequirements req_info = {
-        .pCreateInfo = &probe_ci,
-    };
-    const auto device = instance.GetDevice();
-    const auto reqs = device.getBufferMemoryRequirements(req_info).memoryRequirements;
-    block_size = Common::AlignUp(std::max<u64>(reqs.alignment, MIN_BLOCK_SIZE), reqs.alignment);
+    sparse_buffers = instance.IsSparseBufferSupported();
+    if (sparse_buffers) {
+        const vk::BufferCreateInfo probe_ci = {
+            .flags = vk::BufferCreateFlagBits::eSparseBinding |
+                     vk::BufferCreateFlagBits::eSparseResidency,
+            .size = ARENA_PAGE_SIZE,
+            .usage = ARENA_USAGE,
+            .sharingMode = vk::SharingMode::eExclusive,
+        };
+        const vk::DeviceBufferMemoryRequirements req_info = {
+            .pCreateInfo = &probe_ci,
+        };
+        const auto reqs =
+            instance.GetDevice().getBufferMemoryRequirements(req_info).memoryRequirements;
+        block_size = Common::AlignUp(std::max<u64>(reqs.alignment, MIN_BLOCK_SIZE), reqs.alignment);
+        arena_memory_type_index =
+            FindMemoryType(instance.GetMemoryProperties(), vk::MemoryPropertyFlagBits::eDeviceLocal,
+                           reqs.memoryTypeBits)
+                .value();
+    } else {
+        block_size = 64_KB;
+        LOG_INFO(Render, "Sparse buffers unavailable; using resident buffer ranges");
+    }
     ASSERT_MSG(std::popcount(block_size) == 1, "Sparse block size {} is not a power of 2",
                block_size);
     block_shift = std::bit_width(block_size) - 1;
     blocks_per_arena_page = ARENA_PAGE_SIZE / block_size;
     blocks_per_arena_page_shift = ARENA_PAGE_BITS - block_shift;
-    arena_memory_type_index =
-        FindMemoryType(instance.GetMemoryProperties(), vk::MemoryPropertyFlagBits::eDeviceLocal,
-                       reqs.memoryTypeBits)
-            .value();
 
     const u64 bda_pagetable_size =
         (blocks_per_arena_page * NUM_ARENA_PAGES) * sizeof(vk::DeviceAddress);
@@ -92,6 +99,9 @@ BufferCache::~BufferCache() = default;
 void BufferCache::TickFrame() {
     if (std::exchange(fault_process_pending, false)) {
         fault_manager->ProcessFaultBuffer();
+    }
+    if (!retired_dense_arenas.empty()) {
+        scheduler.DeferOperation([buffers = std::exchange(retired_dense_arenas, {})]() {});
     }
 }
 
@@ -169,18 +179,36 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
                                                         bool is_written, bool is_texel_buffer) {
+    u32 resident_size = size;
+    bool aliases_image = false;
+    if (!sparse_buffers && is_texel_buffer && !is_written) {
+        if (const auto image_id = texture_cache.FindImageFromRange(device_addr, size)) {
+            const auto& image = texture_cache.GetImage(image_id);
+            ASSERT_MSG(device_addr == image.info.guest_address,
+                       "Texel buffer aliases image subresources {:x} : {:x}", device_addr,
+                       image.info.guest_address);
+            resident_size = std::max(size, image.info.guest_size);
+            aliases_image = true;
+        }
+    }
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
-    if (!is_written && size <= STREAM_THRESHOLD && !IsRegionGpuModified(device_addr, size)) {
+    if (!is_written && !aliases_image && size <= STREAM_THRESHOLD &&
+        !IsRegionGpuModified(device_addr, size)) {
         const auto [data, offset] = stream_buffer.Map(size, instance.UniformMinAlignment());
         memory->CopySparseMemory(device_addr, data, size);
         stream_buffer.Commit();
         return {&stream_buffer, offset};
     }
     const u64 first_block = device_addr >> block_shift;
-    const u64 last_block = (device_addr + size - 1) >> block_shift;
-    const auto* arena = GetArena(first_block, last_block);
-    EnsureResident(arena, first_block, last_block);
-    SynchronizeMemory(arena, device_addr, size, is_written, is_texel_buffer);
+    const u64 last_block = (device_addr + resident_size - 1) >> block_shift;
+    const Buffer* arena;
+    u64 generation;
+    do {
+        arena = GetArena(first_block, last_block);
+        EnsureResident(arena, first_block, last_block);
+        generation = buffer_generation;
+        SynchronizeMemory(arena, device_addr, resident_size, is_written, is_texel_buffer);
+    } while (generation != buffer_generation);
     if (is_written) {
         gpu_modified_ranges.Add(device_addr, size);
     }
@@ -208,6 +236,25 @@ bool BufferCache::IsRegionGpuModified(VAddr addr, size_t size) {
 
 void BufferCache::SynchronizeDmaBuffers() {
     fault_process_pending = true;
+    if (!sparse_buffers) {
+        for (const auto& [base_block, arena] : dense_arenas) {
+            const u64 end_block = base_block + (arena->size_bytes >> block_shift);
+            resident_ranges.ForEachInRange(base_block, end_block, [&](const Backing& range) {
+                const u64 start = std::max(base_block, range.start);
+                const u64 end = std::min(end_block, range.end);
+                VAddr address = start << block_shift;
+                u64 remaining = (end - start) << block_shift;
+                constexpr u64 max_upload_size = std::numeric_limits<u32>::max() & ~u64{4095};
+                while (remaining) {
+                    const u32 size = static_cast<u32>(std::min(remaining, max_upload_size));
+                    SynchronizeMemory(arena.get(), address, size, false, false);
+                    address += size;
+                    remaining -= size;
+                }
+            });
+        }
+        return;
+    }
     for (const auto& range : resident_ranges) {
         const u64 page = range.start >> (ARENA_PAGE_BITS - block_shift);
         const VAddr device_addr = range.start << block_shift;
@@ -217,6 +264,9 @@ void BufferCache::SynchronizeDmaBuffers() {
 }
 
 const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
+    if (!sparse_buffers) {
+        return GetDenseArena(first_block, last_block);
+    }
     const u64 first_page = first_block >> blocks_per_arena_page_shift;
     const u64 last_page = last_block >> blocks_per_arena_page_shift;
     ASSERT_MSG(last_page - first_page <= 1,
@@ -270,6 +320,110 @@ const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
     return new_arena;
 }
 
+const Buffer* BufferCache::GetDenseArena(u64 first_block, u64 last_block) {
+    ASSERT_MSG(first_block <= last_block &&
+                   last_block < (u64{1} << (ADDRESS_SPACE_BITS - block_shift)),
+               "Buffer range exceeds guest address space");
+
+    const auto find_first = [&](u64 block) {
+        auto it = dense_arenas.upper_bound(block);
+        if (it != dense_arenas.begin()) {
+            const auto prev = std::prev(it);
+            if (prev->first + (prev->second->size_bytes >> block_shift) > block) {
+                return prev;
+            }
+        }
+        return it;
+    };
+    auto first = find_first(first_block);
+    if (first != dense_arenas.end() && first->first <= first_block &&
+        first->first + (first->second->size_bytes >> block_shift) > last_block) {
+        return first->second.get();
+    }
+
+    u64 base_block = first_block;
+    u64 end_block = last_block + 1;
+    auto last = first;
+    const auto expand_overlaps = [&] {
+        last = first;
+        while (last != dense_arenas.end() && last->first < end_block) {
+            base_block = std::min(base_block, last->first);
+            end_block =
+                std::max(end_block, last->first + (last->second->size_bytes >> block_shift));
+            ++last;
+        }
+    };
+    expand_overlaps();
+    const bool migrating = first != last;
+    if (migrating) {
+        const u64 old_start = first->first;
+        const auto& [old_last_start, old_last] = *std::prev(last);
+        const u64 old_end = old_last_start + (old_last->size_bytes >> block_shift);
+        const u64 padding =
+            std::min(std::max<u64>((old_end - old_start) / 2, 1), u64{1_MB} >> block_shift);
+        if (first_block < old_start) {
+            base_block -= std::min(base_block, padding);
+        }
+        if (last_block + 1 > old_end) {
+            end_block = std::min(end_block + padding, u64{1} << (ADDRESS_SPACE_BITS - block_shift));
+        }
+        first = find_first(base_block);
+        expand_overlaps();
+    }
+
+    auto arena =
+        std::make_unique<Buffer>(instance, base_block << block_shift,
+                                 (end_block - base_block) << block_shift, MemoryType::DeviceLocal);
+    const auto* result = arena.get();
+    for (auto it = first; it != last;) {
+        const vk::BufferCopy copy = {
+            .srcOffset = 0,
+            .dstOffset = result->Offset(it->second->cpu_addr),
+            .size = it->second->size_bytes,
+        };
+        runtime.CopyBuffer(it->second.get(), result, std::span{&copy, 1});
+        retired_dense_arenas.emplace_back(std::move(it->second));
+        it = dense_arenas.erase(it);
+    }
+    dense_arenas.emplace(base_block, std::move(arena));
+    if (migrating) {
+        ++buffer_generation;
+        IntervalList<> migrated_ranges;
+        resident_ranges.ForEachInRange(base_block, end_block, [&](const Backing& range) {
+            migrated_ranges.Add(
+                {std::max(base_block, range.start), std::min(end_block, range.end)});
+        });
+        UpdatePageTable(result, migrated_ranges);
+    }
+    return result;
+}
+
+void BufferCache::UpdatePageTable(const Buffer* arena, const IntervalList<>& ranges) {
+    u64 num_blocks{};
+    for (const auto& range : ranges) {
+        num_blocks += range.end - range.start;
+    }
+    if (!num_blocks) {
+        return;
+    }
+
+    const auto staging =
+        staging_pool.Request(num_blocks * sizeof(vk::DeviceAddress), MemoryType::HostUncached);
+    auto* addresses = reinterpret_cast<vk::DeviceAddress*>(staging.mapped);
+    boost::container::small_vector<vk::BufferCopy, 8> copies;
+    u64 offset = staging.offset;
+    for (const auto& range : ranges) {
+        for (u64 block = range.start; block < range.end; ++block) {
+            *addresses++ = arena->BufferDeviceAddress() + arena->Offset(block << block_shift);
+        }
+        const u64 size = (range.end - range.start) * sizeof(vk::DeviceAddress);
+        copies.emplace_back(offset, range.start * sizeof(vk::DeviceAddress), size);
+        offset += size;
+    }
+    staging.Flush();
+    runtime.CopyBuffer(staging.buffer, bda_pagetable_buffer.get(), copies);
+}
+
 void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_block) {
     u32 resident_blocks{};
     IntervalList bind_ranges;
@@ -279,6 +433,14 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
     });
 
     if (bind_ranges.Empty()) {
+        return;
+    }
+
+    if (!sparse_buffers) {
+        for (const auto& range : bind_ranges) {
+            resident_ranges.Add(Backing{{range.start, range.end}, {}, range.start});
+        }
+        UpdatePageTable(arena, bind_ranges);
         return;
     }
 

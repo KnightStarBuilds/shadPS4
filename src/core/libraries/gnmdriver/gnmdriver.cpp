@@ -80,6 +80,9 @@ static constexpr u32 tessellation_offchip_buffer_size = 0x800000u;
 
 static void ResetSubmissionLock(Platform::InterruptId irq) {
     std::unique_lock lock{m_wait_idle};
+    if (!liverpool->IsGpuIdle()) {
+        return;
+    }
     submission_lock = 0;
     cv_lock.notify_all();
 }
@@ -162,6 +165,7 @@ s32 PS4_SYSV_ABI sceGnmAddEqEvent(OrbisKernelEqueue eq, u64 id, void* udata) {
 
 int PS4_SYSV_ABI sceGnmAreSubmitsAllowed() {
     LOG_TRACE(Lib_GnmDriver, "called");
+    std::scoped_lock lock{m_wait_idle};
     return submission_lock == 0;
 }
 
@@ -2357,10 +2361,11 @@ s32 PS4_SYSV_ABI sceGnmSubmitDone() {
     LOG_DEBUG(Lib_GnmDriver, "called");
     std::scoped_lock lk{m_submit_lock};
     WaitGpuIdle();
-    if (!liverpool->IsGpuIdle()) {
-        submission_lock = true;
+    {
+        std::scoped_lock lock{m_wait_idle};
+        submission_lock = !liverpool->IsGpuIdle();
+        liverpool->SubmitDone();
     }
-    liverpool->SubmitDone();
     send_init_packet = true;
     ++frames_submitted;
     DebugState.IncGnmFrameNum();

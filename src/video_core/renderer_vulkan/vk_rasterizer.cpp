@@ -196,16 +196,21 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         return;
     }
 
-    PrepareRenderState(pipeline);
-    if (!BindResources(pipeline)) {
-        return;
-    }
-    const auto state = BeginRendering(pipeline);
-
-    BindVertexBuffers(pipeline);
-    if (is_indexed) {
-        BindIndexBuffer(index_offset);
-    }
+    RenderState state;
+    u64 buffer_generation;
+    do {
+        DiscardBindings();
+        buffer_generation = buffer_cache.GetBufferGeneration();
+        PrepareRenderState(pipeline);
+        if (!BindResources(pipeline)) {
+            return;
+        }
+        state = BeginRendering(pipeline);
+        BindVertexBuffers(pipeline);
+        if (is_indexed) {
+            BindIndexBuffer(index_offset);
+        }
+    } while (buffer_generation != buffer_cache.GetBufferGeneration());
 
     if (needs_barrier) {
         runtime.FlushBarriers();
@@ -213,6 +218,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
 
     pipeline->BindResources(set_writes, push_data);
     UpdateDynamicState(pipeline, is_indexed);
+    CommitRenderState();
     scheduler.BeginRendering(state);
 
     const auto& vs_info = pipeline->GetStage(Shader::SwStage::Vertex);
@@ -254,30 +260,38 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         return;
     }
 
-    PrepareRenderState(pipeline);
-    if (!BindResources(pipeline)) {
-        return;
-    }
-    const auto state = BeginRendering(pipeline);
-
-    BindVertexBuffers(pipeline);
-    if (is_indexed) {
-        BindIndexBuffer(0, true);
-    }
-
     const auto size = stride * max_count;
-    const auto [buffer, base] = buffer_cache.ObtainBuffer(arg_address + offset, size, false);
-    needs_barrier |= runtime.IsBufferAccessed(buffer, base, size);
-    bound_buffers.emplace_back(buffer, base, size, vk::AccessFlagBits2::eIndirectCommandRead);
-
+    const VideoCore::Buffer* buffer;
+    u64 base;
     const VideoCore::Buffer* count_buffer;
     u64 count_offset;
-    if (count_address != 0) {
-        std::tie(count_buffer, count_offset) = buffer_cache.ObtainBuffer(count_address, 4, false);
-        needs_barrier |= runtime.IsBufferAccessed(count_buffer, count_offset, 4);
-        bound_buffers.emplace_back(count_buffer, count_offset, 4,
-                                   vk::AccessFlagBits2::eIndirectCommandRead);
-    }
+    RenderState state;
+    u64 buffer_generation;
+    do {
+        DiscardBindings();
+        buffer_generation = buffer_cache.GetBufferGeneration();
+        PrepareRenderState(pipeline);
+        if (!BindResources(pipeline)) {
+            return;
+        }
+        state = BeginRendering(pipeline);
+        BindVertexBuffers(pipeline);
+        if (is_indexed) {
+            BindIndexBuffer(0, true);
+        }
+
+        std::tie(buffer, base) = buffer_cache.ObtainBuffer(arg_address + offset, size, false);
+        needs_barrier |= runtime.IsBufferAccessed(buffer, base, size);
+        bound_buffers.emplace_back(buffer, base, size, vk::AccessFlagBits2::eIndirectCommandRead);
+
+        if (count_address != 0) {
+            std::tie(count_buffer, count_offset) =
+                buffer_cache.ObtainBuffer(count_address, 4, false);
+            needs_barrier |= runtime.IsBufferAccessed(count_buffer, count_offset, 4);
+            bound_buffers.emplace_back(count_buffer, count_offset, 4,
+                                       vk::AccessFlagBits2::eIndirectCommandRead);
+        }
+    } while (buffer_generation != buffer_cache.GetBufferGeneration());
 
     if (needs_barrier) {
         runtime.FlushBarriers();
@@ -285,6 +299,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
 
     pipeline->BindResources(set_writes, push_data);
     UpdateDynamicState(pipeline, is_indexed);
+    CommitRenderState();
     scheduler.BeginRendering(state);
 
     const auto cmdbuf = scheduler.CommandBuffer();
@@ -331,9 +346,14 @@ void Rasterizer::DispatchDirect() {
         return;
     }
 
-    if (!BindResources(pipeline)) {
-        return;
-    }
+    u64 buffer_generation;
+    do {
+        DiscardBindings();
+        buffer_generation = buffer_cache.GetBufferGeneration();
+        if (!BindResources(pipeline)) {
+            return;
+        }
+    } while (buffer_generation != buffer_cache.GetBufferGeneration());
 
     if (needs_barrier) {
         runtime.FlushBarriers();
@@ -361,13 +381,20 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
         return;
     }
 
-    if (!BindResources(pipeline)) {
-        return;
-    }
+    const VideoCore::Buffer* buffer;
+    u64 base;
+    u64 buffer_generation;
+    do {
+        DiscardBindings();
+        buffer_generation = buffer_cache.GetBufferGeneration();
+        if (!BindResources(pipeline)) {
+            return;
+        }
 
-    const auto [buffer, base] = buffer_cache.ObtainBuffer(address + offset, size, false);
-    needs_barrier |= runtime.IsBufferAccessed(buffer, base, size);
-    bound_buffers.emplace_back(buffer, base, size, vk::AccessFlagBits2::eIndirectCommandRead);
+        std::tie(buffer, base) = buffer_cache.ObtainBuffer(address + offset, size, false);
+        needs_barrier |= runtime.IsBufferAccessed(buffer, base, size);
+        bound_buffers.emplace_back(buffer, base, size, vk::AccessFlagBits2::eIndirectCommandRead);
+    } while (buffer_generation != buffer_cache.GetBufferGeneration());
 
     if (needs_barrier) {
         runtime.FlushBarriers();
@@ -577,17 +604,21 @@ void Rasterizer::BindIndexBuffer(u32 index_offset, bool is_indirect) {
 }
 
 void Rasterizer::ResetBindings(bool is_compute) {
-    for (auto& image_id : bound_images) {
-        texture_cache.GetImage(image_id).binding = {};
-    }
     for (const auto [buffer, offset, size, src_access] : bound_buffers) {
         const auto dst_stage = is_compute ? vk::PipelineStageFlagBits2::eComputeShader
                                           : vk::PipelineStageFlagBits2::eAllGraphics;
         runtime.AccessBuffer(buffer, offset, size, dst_stage, src_access);
     }
+    DiscardBindings();
+    needs_barrier = false;
+}
+
+void Rasterizer::DiscardBindings() {
+    for (auto& image_id : bound_images) {
+        texture_cache.GetImage(image_id).binding = {};
+    }
     bound_images.clear();
     bound_buffers.clear();
-    needs_barrier = false;
 }
 
 bool Rasterizer::IsComputeMetaClear(const Pipeline* pipeline) {
@@ -1009,6 +1040,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 
 RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
     attachment_feedback_loop = false;
+    pending_meta_updates.clear();
     const auto& regs = liverpool->regs;
     const auto& key = pipeline->GetGraphicsKey();
     RenderState state;
@@ -1035,7 +1067,7 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
 
         const auto& col_buf = regs.color_buffers[cb];
         const bool is_clear = texture_cache.IsMetaCleared(col_buf.CmaskAddress(), slice);
-        texture_cache.TouchMeta(col_buf.CmaskAddress(), slice, false);
+        pending_meta_updates.emplace_back(col_buf.CmaskAddress(), slice);
 
         if (image->binding.is_bound) {
             ASSERT_MSG(!image->binding.force_general,
@@ -1088,7 +1120,7 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
              regs.depth_control.depth_write_enable) ||
             texture_cache.IsMetaCleared(htile_address, slice);
         const bool is_stencil_clear = regs.depth_render_control.stencil_clear_enable;
-        texture_cache.TouchMeta(htile_address, slice, false);
+        pending_meta_updates.emplace_back(htile_address, slice);
         ASSERT(desc.view_info.range.extent.levels == 1 && !image.binding.needs_rebind);
 
         const bool has_stencil = image.info.props.has_stencil;
@@ -1140,6 +1172,13 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
     }
 
     return state;
+}
+
+void Rasterizer::CommitRenderState() {
+    for (const auto [address, slice] : pending_meta_updates) {
+        texture_cache.TouchMeta(address, slice, false);
+    }
+    pending_meta_updates.clear();
 }
 
 void Rasterizer::Resolve() {
@@ -1219,18 +1258,20 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
     }
     texture_cache.InvalidateMemoryFromGPU(dst, num_bytes);
     const auto* gds_buffer = buffer_cache.GetGdsBuffer();
-    const auto [src_buffer, src_offset] = [&] -> std::pair<const VideoCore::Buffer*, u64> {
-        if (src_gds) {
-            return {gds_buffer, src};
-        }
-        return buffer_cache.ObtainBuffer(src, num_bytes, false, true);
-    }();
-    const auto [dst_buffer, dst_offset] = [&] -> std::pair<const VideoCore::Buffer*, u64> {
-        if (dst_gds) {
-            return {gds_buffer, dst};
-        }
-        return buffer_cache.ObtainBuffer(dst, num_bytes, true, true);
-    }();
+    const VideoCore::Buffer* src_buffer;
+    const VideoCore::Buffer* dst_buffer;
+    u64 src_offset;
+    u64 dst_offset;
+    u64 buffer_generation;
+    do {
+        buffer_generation = buffer_cache.GetBufferGeneration();
+        std::tie(src_buffer, src_offset) =
+            src_gds ? std::pair<const VideoCore::Buffer*, u64>{gds_buffer, src}
+                    : buffer_cache.ObtainBuffer(src, num_bytes, false, true);
+        std::tie(dst_buffer, dst_offset) =
+            dst_gds ? std::pair<const VideoCore::Buffer*, u64>{gds_buffer, dst}
+                    : buffer_cache.ObtainBuffer(dst, num_bytes, true, true);
+    } while (buffer_generation != buffer_cache.GetBufferGeneration());
     const vk::BufferCopy copy = {
         .srcOffset = src_offset,
         .dstOffset = dst_offset,

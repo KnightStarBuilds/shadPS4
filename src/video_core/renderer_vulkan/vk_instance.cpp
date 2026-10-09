@@ -372,6 +372,7 @@ bool Instance::CreateDevice() {
         const u32 index = static_cast<u32>(i);
         if (family_properties[i].queueFlags & vk::QueueFlagBits::eGraphics) {
             queue_family_index = index;
+            queue_flags = family_properties[i].queueFlags;
             graphics_queue_found = true;
         }
     }

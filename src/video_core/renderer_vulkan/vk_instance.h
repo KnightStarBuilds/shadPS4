@@ -75,6 +75,11 @@ public:
         return present_queue;
     }
 
+    bool IsSparseBufferSupported() const {
+        return features.sparseBinding && features.sparseResidencyBuffer &&
+               bool(queue_flags & vk::QueueFlagBits::eSparseBinding);
+    }
+
     TracyVkCtx GetProfilerContext() const {
         return profiler_context;
     }
@@ -512,6 +517,7 @@ private:
     std::unordered_map<vk::Format, vk::FormatProperties3> format_properties;
     TracyVkCtx profiler_context{};
     u32 queue_family_index{0};
+    vk::QueueFlags queue_flags{};
     bool custom_border_color{};
     bool fragment_shader_barycentric{};
     bool amd_shader_explicit_vertex_parameter{};

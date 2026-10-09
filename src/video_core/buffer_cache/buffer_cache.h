@@ -4,6 +4,7 @@
 #pragma once
 
 #include <deque>
+#include <map>
 #include <boost/container/small_vector.hpp>
 
 #include "common/interval_set.h"
@@ -73,6 +74,10 @@ public:
         return block_shift;
     }
 
+    u64 GetBufferGeneration() const noexcept {
+        return buffer_generation;
+    }
+
     void TickFrame();
 
     /// Invalidates any buffer in the logical page range.
@@ -117,6 +122,10 @@ private:
 
     const Buffer* GetArena(u64 first_block, u64 last_block);
 
+    const Buffer* GetDenseArena(u64 first_block, u64 last_block);
+
+    void UpdatePageTable(const Buffer* arena, const IntervalList<>& ranges);
+
     void EnsureResident(const Buffer* arena, u64 first_block, u64 last_block);
 
     void DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size);
@@ -159,6 +168,11 @@ private:
         }
     };
     IntervalList<Backing> resident_ranges;
+
+    std::map<u64, std::unique_ptr<Buffer>> dense_arenas;
+    std::vector<std::unique_ptr<Buffer>> retired_dense_arenas;
+    u64 buffer_generation{};
+    bool sparse_buffers{};
 
     u32 arena_memory_type_index{};
     u32 block_size{};
